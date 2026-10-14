@@ -810,6 +810,39 @@ async fn test_empty_select() -> Result<(), Error> {
 
 #[cfg(feature = "tokio_io")]
 #[tokio::test]
+async fn test_query_error_allows_reusing_pooled_handle() -> Result<(), Error> {
+    let options = Options::from_str(&database_url())?
+        .pool_min(1)
+        .pool_max(1)
+        .ping_before_query(true);
+    let pool = Pool::new(options);
+    let mut client = pool.get_handle().await?;
+
+    for _ in 0..3 {
+        let error = client
+            .query("SELECT clickhouse_rs_missing_column FROM system.one")
+            .fetch_all()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Server(ref error) if error.code == 47));
+        assert_eq!(pool.info().ongoing, 0);
+
+        client.execute("SELECT 1").await?;
+        let block = client.query("SELECT 42 AS value").fetch_all().await?;
+        assert_eq!(block.get::<u8, _>(0, "value")?, 42);
+        assert_eq!(pool.info().ongoing, 1);
+    }
+
+    drop(client);
+    assert_eq!(pool.info().ongoing, 0);
+    let mut client = pool.get_handle().await?;
+    client.execute("SELECT 1").await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "tokio_io")]
+#[tokio::test]
 async fn test_select_settings() -> Result<(), Error> {
     let options = Options::from_str(&database_url())?.with_setting(
         "max_threads",

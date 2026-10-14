@@ -107,8 +107,11 @@ parameters:
 - `retry_timeout` - Amount of time to wait before next retry. (defaults to `5 sec`).
 - `ping_timeout` - Timeout for ping (defaults to `500 ms`).
 
-
 - `alt_hosts` - Comma separated list of single address host for load-balancing.
+
+A server exception from a streamed query discards that query's connection.
+With `ping_before_query=true` and retries enabled, the same pooled handle can
+reconnect on its next operation; callers do not need to replace the handle.
 
 example:
 ```url

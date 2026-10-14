@@ -37,12 +37,14 @@ pub(crate) enum BlockStreamState {
 
 impl<'a> Drop for BlockStream<'a> {
     fn drop(&mut self) {
+        // Stream ownership ends even when an exception discards the transport.
+        // Reattach the handle so its next operation can use normal reconnection.
+        if !self.client.pool.is_attached() && self.client.pool.is_some() {
+            self.client.pool.attach();
+        }
+
         match self.state {
             BlockStreamState::Reading => {
-                if !self.client.pool.is_attached() {
-                    self.client.pool.attach();
-                }
-
                 if let Some(mut transport) = self.inner.take_transport() {
                     transport.inconsistent = true;
                     self.client.inner = Some(transport);
