@@ -35,6 +35,17 @@ fn pending_open_limit(max: usize) -> usize {
     max.min(PENDING_OPEN_LIMIT)
 }
 
+// Cancels a background connection open when the pool drops its queued future.
+#[cfg(not(feature = "async_std"))]
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+#[cfg(not(feature = "async_std"))]
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) struct Inner {
     new: crossbeam::queue::ArrayQueue<BoxFuture<'static, Result<ClientHandle>>>,
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
@@ -382,7 +393,36 @@ impl Pool {
             }
         };
 
-        Box::pin(async move { Self::retry_open(source, pool, max_attempts, retry_timeout).await })
+        #[cfg(not(feature = "async_std"))]
+        let inner = pool.inner();
+        let open = async move { Self::retry_open(source, pool, max_attempts, retry_timeout).await };
+
+        // Run the open as its own task so it keeps making progress after the waiter that
+        // started it leaves. Otherwise the connect timeout keeps running while nobody polls
+        // the open, and the next waiter gets a timeout error for a healthy server.
+        #[cfg(not(feature = "async_std"))]
+        {
+            Box::pin(async move {
+                let mut task = AbortOnDrop(tokio::spawn(async move {
+                    let result = open.await;
+                    if let Some(inner) = inner.upgrade() {
+                        inner.wake_tasks();
+                    }
+                    result
+                }));
+
+                (&mut task.0).await.unwrap_or_else(|err| {
+                    Err(Error::Io(IoError::other(format!(
+                        "ClickHouse connection open task failed: {err}"
+                    ))))
+                })
+            })
+        }
+
+        #[cfg(feature = "async_std")]
+        {
+            Box::pin(open)
+        }
     }
 
     async fn retry_open(
@@ -432,6 +472,7 @@ impl Pool {
                             "Failed to connect to ClickHouse due to non-retriable IO error: {}",
                             err
                         );
+                        return result;
                     }
                 }
                 Err(_) => return result,
@@ -1223,6 +1264,76 @@ mod test {
         assert_eq!(pool.info().new_len, 0);
         assert_eq!(pool.inner.conn_count(), 0);
         assert_eq!(pool.inner.pending_open_count(), 0);
+        Ok(())
+    }
+
+    fn single_slot_pool() -> Pool {
+        let options = Options::from_str(DATABASE_URL.as_str())
+            .unwrap()
+            .pool_min(0)
+            .pool_max(1)
+            .connection_timeout(Duration::from_millis(500));
+        Pool::new(options)
+    }
+
+    #[tokio::test]
+    async fn test_abandoned_pending_open_completes_in_background() -> Result<()> {
+        let pool = single_slot_pool();
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // The first poll queues the open; the second poll starts it.
+        let mut abandoned = Box::pin(pool.get_handle());
+        assert!(matches!(abandoned.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(abandoned.as_mut().poll(&mut cx), Poll::Pending));
+        drop(abandoned);
+
+        // Nobody polls the pool for longer than the connection timeout.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let mut c = pool.get_handle().await?;
+        c.ping().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_open_wakes_parked_waiters() -> Result<()> {
+        let pool = single_slot_pool();
+
+        let (parked_wakes, parked_waker) = count_waker();
+        let mut parked_cx = Context::from_waker(&parked_waker);
+        let mut parked = Box::pin(pool.get_handle());
+        assert!(matches!(
+            parked.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            parked.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+
+        // A later waiter becomes the last one to poll the open, so only a
+        // completion that wakes every parked waiter reaches the first one.
+        let (_other_wakes, other_waker) = count_waker();
+        let mut other_cx = Context::from_waker(&other_waker);
+        let mut other = Box::pin(pool.get_handle());
+        assert!(matches!(other.as_mut().poll(&mut other_cx), Poll::Pending));
+
+        let baseline = parked_wakes.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while parked_wakes.load(Ordering::SeqCst) == baseline {
+            assert!(
+                Instant::now() < deadline,
+                "parked waiter was not woken after the connection opened"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut c = tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("parked waiter did not get the opened connection")?;
+        c.ping().await?;
+        drop(other);
         Ok(())
     }
 
